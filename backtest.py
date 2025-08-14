@@ -4,12 +4,6 @@ import pandas as pd
 from core_strategy import decide
 
 def run_backtest(df: pd.DataFrame, horizon: str, initial_capital=100000, risk_per_trade=0.01):
-    """
-    Лёгкий симулятор для демонстрации:
-    - проходим по дням
-    - на каждом дне считаем решение; одна позиция за раз
-    - фиксация: 50% на TP1, остальное на TP2/SL
-    """
     cap = initial_capital
     pos = None
     trades = []
@@ -78,3 +72,5 @@ def run_backtest(df: pd.DataFrame, horizon: str, initial_capital=100000, risk_pe
     eq = pd.DataFrame(equity).set_index("date")
     tr = pd.DataFrame(trades)
     return eq, tr
+
+        
