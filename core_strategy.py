@@ -20,8 +20,6 @@ def fib_pivots(H: float, L: float, C: float) -> dict:
 
 def aggregate_prev_HLC(df: pd.DataFrame, horizon: str) -> tuple[float,float,float,str]:
     """
-    df: DatetimeIndex, cols: Open, High, Low, Close
-    horizon: 'ST' | 'MID' | 'LT'
     ST -> strictly previous WEEK (weekly pivots)
     MID -> previous MONTH
     LT -> previous YEAR
@@ -37,7 +35,6 @@ def aggregate_prev_HLC(df: pd.DataFrame, horizon: str) -> tuple[float,float,floa
         grp = df.resample("Y").agg({"High":"max","Low":"min","Close":"last"}).dropna()
 
     if len(grp) < 2:
-        # graceful fallback to lower frame
         if base_tf == "Y":
             grp = df.resample("M").agg({"High":"max","Low":"min","Close":"last"}).dropna()
         elif base_tf == "M":
@@ -124,6 +121,44 @@ def targets_long(entry_zone: str, piv: dict) -> list[float]:
         return [min(piv["P"], piv["R1"]), max(piv["R1"], piv["R2"])]
     return [min(piv["P"], piv["R1"]), piv["R2"]]
 
+# ---------- Filters ----------
+def regime_filter(df: pd.DataFrame, base_tf: str) -> str:
+    # 'UP' | 'DOWN' | 'FLAT'  (на старшем ТФ)
+    if base_tf == "W": res = df.resample("W").last()
+    elif base_tf == "M": res = df.resample("M").last()
+    else: res = df.resample("Y").last()
+    close = res["Close"].dropna()
+    if len(close) < 60: return "FLAT"
+    ma = close.rolling(50).mean()
+    slope = (ma.iloc[-1] - ma.iloc[-10]) / max(1e-9, ma.iloc[-10])
+    vol = (close.rolling(14).std() / close).iloc[-1]
+    if slope > 0.01 and vol < 0.06:
+        return "UP"
+    if slope < -0.01 and vol < 0.06:
+        return "DOWN"
+    return "FLAT"
+
+def zone_confirmation(df: pd.DataFrame) -> bool:
+    # простейший price-action: длинная тень против входа
+    o, h, l, c = df["Open"].iloc[-1], df["High"].iloc[-1], df["Low"].iloc[-1], df["Close"].iloc[-1]
+    rng = h - l
+    if rng <= 0: return False
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    body = abs(c - o)
+    bull = (lower_wick / max(1e-9, rng) >= 0.4) and (c > o) and (body/rng <= 0.6)
+    bear = (upper_wick / max(1e-9, rng) >= 0.4) and (c < o) and (body/rng <= 0.6)
+    return bull or bear
+
+def rr_ok(entry: float, tp1: float, sl: float, min_rr: float = 2.0) -> bool:
+    risk = abs(entry - sl)
+    reward = abs(tp1 - entry)
+    return (risk > 0) and (reward / risk >= min_rr)
+
+def events_guard(date: pd.Timestamp, ticker: str) -> bool:
+    # Заглушка: всегда True. (Подключим календарь позже)
+    return True
+
 # ---------- Overheat detector ----------
 def detect_overheat(df: pd.DataFrame, piv: dict, horizon: str) -> dict:
     price = float(df["Close"].iloc[-1])
@@ -160,7 +195,6 @@ def decide(df: pd.DataFrame, horizon: str) -> dict:
     atr_last = float(atr(df).iloc[-1])
 
     atr_k_sl = {"ST":0.8, "MID":1.0, "LT":1.3}[horizon]
-    tol      = {"ST":0.006, "MID":0.009, "LT":0.012}[horizon]
 
     def r(x):
         if x is None: return None
@@ -171,28 +205,24 @@ def decide(df: pd.DataFrame, horizon: str) -> dict:
     at_bottom = price <= piv["S2"]
     in_mid    = (piv["S1"] < price < piv["R1"])
 
+    # базовые решения
     if horizon == "ST":
-        # strictly weekly pivots
         if in_mid and not at_top and not at_bottom:
-            base=("WAIT",None,None,None,None)
-            alt =("WAIT",None,None,None,None)
+            base=("WAIT",None,None,None,None); alt=("WAIT",None,None,None,None)
         elif at_top and ctx["overheat"]:
             entry_zone = "R3" if price >= piv["R3"] else "R2"
             t1, t2 = targets_short(entry_zone, piv)
             entry = price
             sl = max(piv[entry_zone], entry) + atr_k_sl*atr_last
-            base=("SHORT", entry, t1, t2, sl)
-            alt =("WAIT",None,None,None,None)
+            base=("SHORT", entry, t1, t2, sl); alt=("WAIT",None,None,None,None)
         elif at_bottom:
             entry_zone = "S3" if price <= piv["S3"] else "S2"
             t1, t2 = targets_long(entry_zone, piv)
             entry = price
             sl = min(piv[entry_zone], entry) - atr_k_sl*atr_last
-            base=("LONG", entry, t1, t2, sl)
-            alt =("WAIT",None,None,None,None)
+            base=("LONG", entry, t1, t2, sl); alt=("WAIT",None,None,None,None)
         else:
-            base=("WAIT",None,None,None,None)
-            alt =("WAIT",None,None,None,None)
+            base=("WAIT",None,None,None,None); alt=("WAIT",None,None,None,None)
 
     elif horizon == "MID":
         if ctx["overheat"] and at_top:
@@ -207,8 +237,7 @@ def decide(df: pd.DataFrame, horizon: str) -> dict:
             t1, t2 = targets_long(entry_zone, piv)
             entry = min(piv["P"], price)
             sl = min(piv[entry_zone], entry) - atr_k_sl*atr_last
-            base=("LONG", entry, t1, t2, sl)
-            alt =("WAIT",None,None,None,None)
+            base=("LONG", entry, t1, t2, sl); alt=("WAIT",None,None,None,None)
         else:
             base=("WAIT",None,None,None,None)
             alt =("LONG", min(piv["P"], price), piv["R1"], piv["R2"], min(piv["P"], price) - atr_k_sl*atr_last)
@@ -226,18 +255,44 @@ def decide(df: pd.DataFrame, horizon: str) -> dict:
             t1, t2 = targets_long(entry_zone, piv)
             entry = min(piv["P"], price)
             sl = min(piv[entry_zone], entry) - atr_k_sl*atr_last
-            base=("LONG", entry, t1, t2, sl)
-            alt =("WAIT",None,None,None,None)
+            base=("LONG", entry, t1, t2, sl); alt=("WAIT",None,None,None,None)
         else:
             base=("WAIT",None,None,None,None)
             alt =("LONG", min(piv["P"], price), piv["R1"], piv["R2"], min(piv["P"], price) - atr_k_sl*atr_last)
+
+    # -------- общие фильтры --------
+    base_tf_for_regime = {"ST":"W","MID":"M","LT":"Y"}[horizon]
+    regime = regime_filter(df, base_tf_for_regime)
+
+    def apply_filters(side):
+        act, entry, tp1, tp2, sl = side
+        if act in ("LONG","SHORT"):
+            if not events_guard(df.index[-1], "TICKER"):
+                return ("WAIT", None, None, None, None)
+            if not zone_confirmation(df):
+                return ("WAIT", None, None, None, None)
+            if not rr_ok(entry, tp1, sl, 2.0):
+                return ("WAIT", None, None, None, None)
+            if act == "LONG" and regime == "DOWN":
+                return ("WAIT", None, None, None, None)
+            if act == "SHORT" and regime == "UP":
+                return ("WAIT", None, None, None, None)
+        return side
+
+    base = apply_filters(base)
+    alt  = apply_filters(alt)
+
+    def r2(x):
+        if x is None: return None
+        try: return round(float(x), 2)
+        except: return None
 
     out = {
         "price": round(price,2),
         "horizon": horizon,
         "pivots": {k: round(v,2) for k,v in piv.items()},
-        "base": {"action": base[0], "entry": r(base[1]), "tp1": r(base[2]), "tp2": r(base[3]), "sl": r(base[4])},
-        "alt":  {"action": alt[0],  "entry": r(alt[1]),  "tp1": r(alt[2]),  "tp2": r(alt[3]),  "sl": r(alt[4])},
-        "ctx": ctx
+        "base": {"action": base[0], "entry": r2(base[1]), "tp1": r2(base[2]), "tp2": r2(base[3]), "sl": r2(base[4])},
+        "alt":  {"action": alt[0],  "entry": r2(alt[1]),  "tp1": r2(alt[2]),  "tp2": r2(alt[3]),  "sl": r2(alt[4])},
+        "ctx": {**ctx, "regime": regime}
     }
     return out
