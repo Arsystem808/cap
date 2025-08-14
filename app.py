@@ -6,10 +6,13 @@ from core_strategy import decide
 from narrator import humanize
 from backtest import run_backtest
 
-st.set_page_config(page_title="CapinteL-Q AI", page_icon="📈", layout="centered")
+st.set_page_config(page_title="CapinteL-Q AI (with filters)", page_icon="📈", layout="centered")
+st.title("CapinteL-Q AI — живой анализ рынка (фильтры включены)")
 
-st.title("CapinteL-Q AI — живой анализ рынка")
-
+@st.cache_data(ttl=900)
+def load_yahoo(ticker: str, years: str) -> pd.DataFrame:
+    df = yf.download(ticker, period=years, interval="1d", auto_adjust=False, progress=False)
+    return df.rename(columns=str.title)[["Open","High","Low","Close"]].dropna()
 
 # --- Input ---
 col1, col2 = st.columns([2,1])
@@ -35,23 +38,22 @@ tab1, tab2 = st.tabs(["Анализ", "Backtest"])
 with tab1:
     if st.button("Проанализировать", type="primary"):
         try:
-            data = yf.download(ticker, period=years, interval="1d", auto_adjust=False, progress=False)
-            data = data.rename(columns=str.title)[["Open","High","Low","Close"]].dropna()
-            if len(data) < 80:
-                st.error("Мало данных для анализа. Попробуйте увеличить период.")
-            else:
-                hz = map_hz(horizon_label)
-                if hz is None:
-                    rng = data["Close"].rolling(60).agg(["min","max"]).dropna()
-                    if len(rng)==0:
-                        hz = "MID"
-                    else:
-                        pos = (data["Close"].iloc[-1] - rng["min"].iloc[-1]) / max(1e-9, (rng["max"].iloc[-1]-rng["min"].iloc[-1]))
-                        hz = "LT" if pos > 0.85 or pos < 0.15 else ("MID" if 0.25 < pos < 0.75 else "ST")
-
-                res = decide(data, hz)
-                txt = humanize(ticker, hz, res)
-                st.markdown(txt)
+            with st.spinner("Загружаем данные и формируем взгляд..."):
+                data = load_yahoo(ticker, years)
+                if len(data) < 80:
+                    st.error("Мало данных для анализа. Попробуйте увеличить период.")
+                else:
+                    hz = map_hz(horizon_label)
+                    if hz is None:
+                        rng = data["Close"].rolling(60).agg(["min","max"]).dropna()
+                        if len(rng)==0:
+                            hz = "MID"
+                        else:
+                            pos = (data["Close"].iloc[-1] - rng["min"].iloc[-1]) / max(1e-9, (rng["max"].iloc[-1]-rng["min"].iloc[-1]))
+                            hz = "LT" if pos > 0.85 or pos < 0.15 else ("MID" if 0.25 < pos < 0.75 else "ST")
+                    res = decide(data, hz)
+                    txt = humanize(ticker, hz, res)
+                    st.markdown(txt)
         except Exception as e:
             st.error(f"Ошибка анализа: {e}")
 
@@ -68,17 +70,38 @@ with tab2:
 
     if st.button("Запустить Backtest"):
         try:
-            data = yf.download(ticker, period=years, interval="1d", auto_adjust=False, progress=False)
-            data = data.rename(columns=str.title)[["Open","High","Low","Close"]].dropna()
-            hz = map_hz(bt_hz_label)
-            eq, tr = run_backtest(data, hz, capital, risk)
-            if eq is None or eq.empty:
-                st.info("Нет сделок по заданным условиям.")
-            else:
-                st.line_chart(eq, y="equity")
-                st.write(f"Сделки: {len(tr)}")
-                if not tr.empty:
-                    st.dataframe(tr)
+            with st.spinner("Грузим данные и считаем сделки..."):
+                data = load_yahoo(ticker, years)
+                hz = map_hz(bt_hz_label)
+                eq, tr = run_backtest(data, hz, capital, risk)
+                if eq is None or eq.empty:
+                    st.info("Нет сделок по заданным условиям.")
+                else:
+                    st.line_chart(eq, y="equity")
+                    st.write(f"Сделки: {len(tr)}")
+                    if not tr.empty:
+                        st.dataframe(tr)
+
+                        # --- метрики бэктеста ---
+                        if "tp1_hit" in tr.columns:
+                            tr["tp1_hit"] = tr["tp1_hit"].fillna(False)
+                            wins = int(tr["tp1_hit"].sum())
+                        else:
+                            wins = 0
+                        total = len(tr)
+                        hit_rate = 100.0 * wins / max(1, total)
+
+                        total_pnl = float(tr.get("pnl", pd.Series([0]*total)).sum())
+                        roll_max = eq["equity"].cummax()
+                        drawdown = (eq["equity"] - roll_max) / roll_max
+                        max_dd = 100.0 * float(drawdown.min())
+
+                        st.markdown(
+                            f"**Hit-rate (TP1 до SL):** {hit_rate:.1f}%  \n"
+                            f"**Сделок:** {total}  \n"
+                            f"**Итоговый P/L:** ${total_pnl:,.0f}  \n"
+                            f"**Макс. просадка:** {max_dd:.1f}%"
+                        )
         except Exception as e:
             st.error(f"Ошибка бэктеста: {e}")
 
